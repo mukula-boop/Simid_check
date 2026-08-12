@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>media.net SIMID Tracking Overlay</title>
+<style>
+  /* Intentionally invisible: this creative shows no visual on top of the video.
+     Its only job is to fire two pixels at creative start. */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+</style>
+</head>
+<body>
+  <!-- No visible UI by design. -->
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------------------------------------------------------------------------
+   * Pixel URLs are NO LONGER hardcoded. They arrive from the VAST <AdParameters>
+   * via creativeData.adParameters in the SIMID:Player:init message and are parsed
+   * in handleInit() below.
+   *
+   *   pixelHtml   -> fired by THIS creative, directly, with new Image().
+   *   pixelPlayer -> handed to the player via SIMID:Creative:reportTracking so the
+   *                  player fires it (and substitutes VAST macros like [CACHEBUSTING]).
+   * ------------------------------------------------------------------------- */
+  var pixelHtml = null;
+  var pixelPlayer = null;
+
+  var inIframe = window.parent !== window;
+  var sessionId = null;
+  var messageIdCounter = 0;
+  var pending = {};
+
+  function uuidv4() {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+      var r = (Math.random() * 16) | 0;
+      var v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
+  function sendMessage(type, args) {
+    if (!inIframe) {
+      console.log("[SIMID demo - standalone preview]", type, args || {});
+      return Promise.resolve({});
+    }
+    var messageId = ++messageIdCounter;
+    var payload = { sessionId: sessionId, messageId: messageId, timestamp: Date.now(), type: type, args: args || {} };
+    window.parent.postMessage(JSON.stringify(payload), "*");
+    return new Promise(function (resolve, reject) {
+      pending[messageId] = { resolve: resolve, reject: reject };
+    });
+  }
+
+  function respond(kind, messageId, value) {
+    if (!inIframe) return;
+    window.parent.postMessage(JSON.stringify({
+      sessionId: sessionId,
+      messageId: ++messageIdCounter,
+      timestamp: Date.now(),
+      type: kind,
+      args: { messageId: messageId, value: value || {} }
+    }), "*");
+  }
+
+  /* Parse the opaque AdParameters blob and pull the two pixel URLs out of it.
+     Defensive: guards for a missing or non-JSON payload instead of blindly
+     JSON.parse()-ing, which would throw on an empty adParameters string. */
+  function handleInit(args) {
+    var raw = "";
+    try {
+      raw = (args && args.creativeData && args.creativeData.adParameters) || "";
+    } catch (e) {
+      raw = "";
+    }
+
+    if (!raw) {
+      console.warn("[SIMID] init carried no adParameters; no pixels to fire.");
+      return;
+    }
+
+    var cfg;
+    try {
+      cfg = JSON.parse(raw);
+    } catch (e) {
+      console.error("[SIMID] adParameters is not valid JSON:", e, raw);
+      return;
+    }
+
+    if (cfg && cfg.pixels) {
+      pixelHtml = cfg.pixels.html || null;
+      pixelPlayer = cfg.pixels.player || null;
+    }
+    console.log("[SIMID] parsed pixels from adParameters:", { html: pixelHtml, player: pixelPlayer });
+  }
+
+  function onMessage(event) {
+    var msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }
+    if (!msg || typeof msg !== "object" || !msg.type) return;
+
+    if (msg.type === "resolve" || msg.type === "reject") {
+      var waiter = pending[msg.args && msg.args.messageId];
+      if (waiter) {
+        delete pending[msg.args.messageId];
+        msg.type === "resolve" ? waiter.resolve(msg.args.value) : waiter.reject(msg.args.value);
+      }
+      return;
+    }
+
+    switch (msg.type) {
+      case "SIMID:Player:init":
+        // Read the pixels out of adParameters BEFORE acknowledging.
+        handleInit(msg.args);
+        respond("resolve", msg.messageId, {});
+        break;
+      case "SIMID:Player:startCreative":
+        respond("resolve", msg.messageId, {});
+        onCreativeStarted();
+        break;
+      case "SIMID:Player:adSkipped":
+      case "SIMID:Player:adStopped":
+      case "SIMID:Player:fatalError":
+        respond("resolve", msg.messageId, {});
+        break;
+    }
+  }
+
+  /* PIXEL_HTML: fired directly from inside the sandboxed iframe.
+     This runs in the creative's own network context (its allow-list) and gets NO
+     player-side macro substitution, so the creative cache-busts it itself. */
+  function firePixelByHtml() {
+    if (!pixelHtml) {
+      console.warn("[SIMID] PIXEL_HTML missing; skipping.");
+      return;
+    }
+    var sep = pixelHtml.indexOf("?") === -1 ? "?" : "&";
+    var url = pixelHtml + sep + "cb=" + Date.now();
+    var img = new Image();
+    img.src = url;
+    console.log("[SIMID] fired PIXEL_HTML directly:", url);
+  }
+
+  /* PIXEL_PLAYER: delegated to the player via reportTracking.
+     The player fires it and replaces VAST macros (e.g. [CACHEBUSTING]) first, so we
+     pass the URL verbatim and do NOT add our own cache-buster. */
+  function firePixelByPlayer() {
+    if (!pixelPlayer) {
+      console.warn("[SIMID] PIXEL_PLAYER missing; skipping.");
+      return;
+    }
+    sendMessage("SIMID:Creative:reportTracking", { trackingUrls: [pixelPlayer] })
+      .then(function () { console.log("[SIMID] player acknowledged reportTracking for PIXEL_PLAYER"); })
+      .catch(function () {});
+    console.log("[SIMID] delegated PIXEL_PLAYER to player:", pixelPlayer);
+  }
+
+  /* Creative start: fire both pixels. No visual is rendered. */
+  function onCreativeStarted() {
+    firePixelByHtml();
+    firePixelByPlayer();
+  }
+
+  function init() {
+    window.addEventListener("message", onMessage);
+
+    if (inIframe) {
+      sessionId = uuidv4();
+      sendMessage("createSession");
+      // Player will now send SIMID:Player:init (with adParameters) then startCreative.
+    } else {
+      // Standalone preview outside any player: no init/adParameters arrives, so seed
+      // demo defaults just so the file is runnable on its own.
+      pixelHtml = "https://httpbin.org/get?evt=fired_by_HTML";
+      pixelPlayer = "https://httpbin.org/get?evt=fired_by_player";
+      onCreativeStarted();
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>
