@@ -1,200 +1,216 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-    <meta charset="utf-8">
-    <title>media.net SIMID Tracking Overlay</title>
-    <style>
-        /* Intentionally invisible: this creative shows no visual on top of the video.
+    <head>
+        <meta charset="utf-8" />
+        <title>media.net SIMID Tracking Overlay</title>
+        <style>
+            /* Intentionally invisible: this creative shows no visual on top of the video.
            Its only job is to fire the tracking pixel at creative start. */
-        html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            height: 100%;
-            background: transparent;
-            overflow: hidden;
-        }
-    </style>
-</head>
-<body>
-<!-- No visible UI by design. -->
-
-<script>
-    (function () {
-        "use strict";
-
-        /* ---------------------------------------------------------------------------
-         * A SINGLE pixel URL arrives from the VAST <AdParameters> via
-         * creativeData.adParameters in the SIMID:Player:init message and is parsed
-         * in handleInit() below (cfg.pixel).
-         *
-         * The same URL is fired twice, distinguished only by a simid_evttype query
-         * param appended at fire time:
-         *
-         *   simid_evttype=1 -> fired by THIS creative, directly, with new Image().
-         *   simid_evttype=0 -> handed to the player via SIMID:Creative:reportTracking so
-         *                     the player fires it (and substitutes VAST macros like
-         *                     [CACHEBUSTING]).
-         * ------------------------------------------------------------------------- */
-        var pixelUrl = null;
-
-        var inIframe = window.parent !== window;
-        var sessionId = null;
-        var messageIdCounter = 0;
-        var pending = {};
-
-        function uuidv4() {
-            return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
-                var r = (Math.random() * 16) | 0;
-                var v = c === "x" ? r : (r & 0x3) | 0x8;
-                return v.toString(16);
-            });
-        }
-
-        function sendMessage(type, args) {
-            if (!inIframe) {
-                console.log("[SIMID demo - standalone preview]", type, args || {});
-                return Promise.resolve({});
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                background: transparent;
+                overflow: hidden;
             }
-            var messageId = ++messageIdCounter;
-            var payload = { sessionId: sessionId, messageId: messageId, timestamp: Date.now(), type: type, args: args || {} };
-            window.parent.postMessage(JSON.stringify(payload), "*");
-            return new Promise(function (resolve, reject) {
-                pending[messageId] = { resolve: resolve, reject: reject };
-            });
-        }
+        </style>
+    </head>
+    <body>
+        <!-- No visible UI by design. -->
 
-        function respond(kind, messageId, value) {
-            if (!inIframe) return;
-            window.parent.postMessage(JSON.stringify({
-                sessionId: sessionId,
-                messageId: ++messageIdCounter,
-                timestamp: Date.now(),
-                type: kind,
-                args: { messageId: messageId, value: value || {} }
-            }), "*");
-        }
+        <script>
+            (function () {
+                "use strict";
 
-        /* Parse the opaque AdParameters blob and pull the pixel URL out of it.
+                /* ---------------------------------------------------------------------------
+                 * A SINGLE pixel URL arrives from the VAST <AdParameters> via
+                 * creativeData.adParameters in the SIMID:Player:init message and is parsed
+                 * in handleInit() below (cfg.pixel).
+                 *
+                 * The same URL is fired twice, distinguished only by a simid_evttype query
+                 * param appended at fire time:
+                 *
+                 *   simid_evttype=1 -> fired by THIS creative, directly, with new Image().
+                 *   simid_evttype=0 -> handed to the player via SIMID:Creative:reportTracking so
+                 *                     the player fires it (and substitutes VAST macros like
+                 *                     [CACHEBUSTING]).
+                 * ------------------------------------------------------------------------- */
+                var pixelUrl = null;
+
+                var inIframe = window.parent !== window;
+                var sessionId = null;
+                var messageIdCounter = 0;
+                var pending = {};
+
+                function uuidv4() {
+                    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+                        var r = (Math.random() * 16) | 0;
+                        var v = c === "x" ? r : (r & 0x3) | 0x8;
+                        return v.toString(16);
+                    });
+                }
+
+                function sendMessage(type, args) {
+                    if (!inIframe) {
+                        console.log("[SIMID demo - standalone preview]", type, args || {});
+                        return Promise.resolve({});
+                    }
+                    var messageId = ++messageIdCounter;
+                    var payload = {
+                        sessionId: sessionId,
+                        messageId: messageId,
+                        timestamp: Date.now(),
+                        type: type,
+                        args: args || {},
+                    };
+                    window.parent.postMessage(JSON.stringify(payload), "*");
+                    return new Promise(function (resolve, reject) {
+                        pending[messageId] = { resolve: resolve, reject: reject };
+                    });
+                }
+
+                function respond(kind, messageId, value) {
+                    if (!inIframe) return;
+                    window.parent.postMessage(
+                        JSON.stringify({
+                            sessionId: sessionId,
+                            messageId: ++messageIdCounter,
+                            timestamp: Date.now(),
+                            type: kind,
+                            args: { messageId: messageId, value: value || {} },
+                        }),
+                        "*"
+                    );
+                }
+
+                /* Parse the opaque AdParameters blob and pull the pixel URL out of it.
            Defensive: guards for a missing or non-JSON payload instead of blindly
            JSON.parse()-ing, which would throw on an empty adParameters string. */
-        function handleInit(args) {
-            var raw = "";
-            try {
-                raw = (args && args.creativeData && args.creativeData.adParameters) || "";
-            } catch (e) {
-                raw = "";
-            }
+                function handleInit(args) {
+                    var raw = "";
+                    try {
+                        raw = (args && args.creativeData && args.creativeData.adParameters) || "";
+                    } catch (e) {
+                        raw = "";
+                    }
 
-            if (!raw) {
-                console.warn("[SIMID] init carried no adParameters; no pixels to fire.");
-                return;
-            }
+                    if (!raw) {
+                        console.warn("[SIMID] init carried no adParameters; no pixels to fire.");
+                        return;
+                    }
 
-            var cfg;
-            try {
-                cfg = JSON.parse(raw);
-            } catch (e) {
-                console.error("[SIMID] adParameters is not valid JSON:", e, raw);
-                return;
-            }
+                    var cfg;
+                    try {
+                        cfg = JSON.parse(raw);
+                    } catch (e) {
+                        console.error("[SIMID] adParameters is not valid JSON:", e, raw);
+                        return;
+                    }
 
-            if (cfg && cfg.pixel) {
-                pixelUrl = cfg.pixel;
-            }
-            console.log("[SIMID] parsed pixel from adParameters:", pixelUrl);
-        }
-
-        function onMessage(event) {
-            var msg;
-            try { msg = JSON.parse(event.data); } catch (e) { return; }
-            if (!msg || typeof msg !== "object" || !msg.type) return;
-
-            if (msg.type === "resolve" || msg.type === "reject") {
-                var waiter = pending[msg.args && msg.args.messageId];
-                if (waiter) {
-                    delete pending[msg.args.messageId];
-                    msg.type === "resolve" ? waiter.resolve(msg.args.value) : waiter.reject(msg.args.value);
+                    if (cfg && cfg.pixel) {
+                        pixelUrl = cfg.pixel;
+                    }
+                    console.log("[SIMID] parsed pixel from adParameters:", pixelUrl);
                 }
-                return;
-            }
 
-            switch (msg.type) {
-                case "SIMID:Player:init":
-                    // Read the pixels out of adParameters BEFORE acknowledging.
-                    handleInit(msg.args);
-                    respond("resolve", msg.messageId, {});
-                    break;
-                case "SIMID:Player:startCreative":
-                    respond("resolve", msg.messageId, {});
-                    onCreativeStarted();
-                    break;
-                case "SIMID:Player:adSkipped":
-                case "SIMID:Player:adStopped":
-                case "SIMID:Player:fatalError":
-                    respond("resolve", msg.messageId, {});
-                    break;
-            }
-        }
+                function onMessage(event) {
+                    var msg;
+                    try {
+                        msg = JSON.parse(event.data);
+                    } catch (e) {
+                        return;
+                    }
+                    if (!msg || typeof msg !== "object" || !msg.type) return;
 
-        function appendParam(url, key, value) {
-            var sep = url.indexOf("?") === -1 ? "?" : "&";
-            return url + sep + key + "=" + value;
-        }
+                    if (msg.type === "resolve" || msg.type === "reject") {
+                        var waiter = pending[msg.args && msg.args.messageId];
+                        if (waiter) {
+                            delete pending[msg.args.messageId];
+                            msg.type === "resolve" ? waiter.resolve(msg.args.value) : waiter.reject(msg.args.value);
+                        }
+                        return;
+                    }
 
-        /* Fired directly from inside the sandboxed iframe, tagged simid_evttype=1 (creative).
+                    switch (msg.type) {
+                        case "SIMID:Player:init":
+                            // Read the pixels out of adParameters BEFORE acknowledging.
+                            handleInit(msg.args);
+                            respond("resolve", msg.messageId, {});
+                            break;
+                        case "SIMID:Player:startCreative":
+                            respond("resolve", msg.messageId, {});
+                            onCreativeStarted();
+                            break;
+                        case "SIMID:Player:adSkipped":
+                        case "SIMID:Player:adStopped":
+                        case "SIMID:Player:fatalError":
+                            respond("resolve", msg.messageId, {});
+                            break;
+                    }
+                }
+
+                function appendParam(url, key, value) {
+                    var sep = url.indexOf("?") === -1 ? "?" : "&";
+                    return url + sep + key + "=" + value;
+                }
+
+                /* Fired directly from inside the sandboxed iframe, tagged simid_evttype=1 (creative).
            This runs in the creative's own network context (its allow-list) and gets NO
            player-side macro substitution, so the creative cache-busts it itself. */
-        function firePixelDirect() {
-            if (!pixelUrl) {
-                console.warn("[SIMID] pixel missing; skipping direct fire.");
-                return;
-            }
-            var url = appendParam(appendParam(pixelUrl, "simid_evttype", "1"), "cb", Date.now());
-            var img = new Image();
-            img.src = url;
-            console.log("[SIMID] fired pixel directly (simid_evttype=1):", url);
-        }
+                function firePixelDirect() {
+                    if (!pixelUrl) {
+                        console.warn("[SIMID] pixel missing; skipping direct fire.");
+                        return;
+                    }
+                    var url = appendParam(appendParam(pixelUrl, "simid_evttype", "1"), "cb", Date.now());
+                    var img = new Image();
+                    img.src = url;
+                    console.log("[SIMID] fired pixel directly (simid_evttype=1):", url);
+                }
 
-        /* Delegated to the player via reportTracking, tagged simid_evttype=0 (player).
+                /* Delegated to the player via reportTracking, tagged simid_evttype=0 (player).
            The player fires it and replaces VAST macros (e.g. [CACHEBUSTING]) first, so we
            pass the URL through with only the simid_evttype param added, and do NOT add our
            own cache-buster. */
-        function firePixelByPlayer() {
-            if (!pixelUrl) {
-                console.warn("[SIMID] pixel missing; skipping player-delegated fire.");
-                return;
-            }
-            var url = appendParam(pixelUrl, "simid_evttype", "0");
-            sendMessage("SIMID:Creative:reportTracking", { trackingUrls: [url] })
-                .then(function () { console.log("[SIMID] player acknowledged reportTracking (simid_evttype=0)"); })
-                .catch(function () {});
-            console.log("[SIMID] delegated pixel to player (simid_evttype=0):", url);
-        }
+                function firePixelByPlayer() {
+                    if (!pixelUrl) {
+                        console.warn("[SIMID] pixel missing; skipping player-delegated fire.");
+                        return;
+                    }
+                    var url = appendParam(pixelUrl, "simid_evttype", "0");
+                    sendMessage("SIMID:Creative:reportTracking", { trackingUrls: [url] })
+                        .then(function () {
+                            console.log("[SIMID] player acknowledged reportTracking (simid_evttype=0)");
+                        })
+                        .catch(function () {});
+                    console.log("[SIMID] delegated pixel to player (simid_evttype=0):", url);
+                }
 
-        /* Creative start: fire the pixel both ways. No visual is rendered. */
-        function onCreativeStarted() {
-            firePixelDirect();
-            firePixelByPlayer();
-        }
+                /* Creative start: fire the pixel both ways. No visual is rendered. */
+                function onCreativeStarted() {
+                    firePixelDirect();
+                    firePixelByPlayer();
+                }
 
-        function init() {
-            window.addEventListener("message", onMessage);
+                function init() {
+                    window.addEventListener("message", onMessage);
 
-            if (inIframe) {
-                sessionId = uuidv4();
-                sendMessage("createSession");
-                // Player will now send SIMID:Player:init (with adParameters) then startCreative.
-            } else {
-                // Standalone preview outside any player: no init/adParameters arrives, so seed
-                // demo defaults just so the file is runnable on its own.
-                pixelUrl = "https://httpbin.org/get?evt=simid_test";
-                onCreativeStarted();
-            }
-        }
+                    if (inIframe) {
+                        sessionId = uuidv4();
+                        sendMessage("createSession");
+                        // Player will now send SIMID:Player:init (with adParameters) then startCreative.
+                    } else {
+                        // Standalone preview outside any player: no init/adParameters arrives, so seed
+                        // demo defaults just so the file is runnable on its own.
+                        pixelUrl = "https://httpbin.org/get?evt=simid_test";
+                        onCreativeStarted();
+                    }
+                }
 
-        document.addEventListener("DOMContentLoaded", init);
-    })();
-</script>
-</body>
+                document.addEventListener("DOMContentLoaded", init);
+            })();
+        </script>
+    </body>
 </html>
