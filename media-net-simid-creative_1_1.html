@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>media.net SIMID Tracking Overlay</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+  }
+</style>
+</head>
+<body>
+
+<script>
+(function () {
+  "use strict";
+
+  var pixel = null;
+
+  var inIframe = window.parent !== window;
+  var sessionId = null;
+  var messageIdCounter = 0;
+  var pending = {};
+
+  function uuidv4() {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+      var r = (Math.random() * 16) | 0;
+      var v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
+  function sendMessage(type, args) {
+    if (!inIframe) {
+      return Promise.resolve({});
+    }
+    var messageId = ++messageIdCounter;
+    var payload = { sessionId: sessionId, messageId: messageId, timestamp: Date.now(), type: type, args: args || {} };
+    window.parent.postMessage(JSON.stringify(payload), "*");
+    return new Promise(function (resolve, reject) {
+      pending[messageId] = { resolve: resolve, reject: reject };
+    });
+  }
+
+  function respond(kind, messageId, value) {
+    if (!inIframe) return;
+    window.parent.postMessage(JSON.stringify({
+      sessionId: sessionId,
+      messageId: ++messageIdCounter,
+      timestamp: Date.now(),
+      type: kind,
+      args: { messageId: messageId, value: value || {} }
+    }), "*");
+  }
+
+  function buildPixel(evttype) {
+    var sep = pixel.indexOf("?") === -1 ? "?" : "&";
+    return pixel + sep + "simid_evttype=" + evttype;
+  }
+
+  function handleInit(args) {
+    var raw = "";
+    try { raw = (args && args.creativeData && args.creativeData.adParameters) || ""; }
+    catch (e) { raw = ""; }
+
+    if (!raw) { return; }
+
+    var cfg;
+    try { cfg = JSON.parse(raw); }
+    catch (e) { return; }
+
+    pixel = cfg.pixel || null;
+  }
+
+  function onMessage(event) {
+    var msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }
+    if (!msg || typeof msg !== "object" || !msg.type) return;
+
+    if (msg.type === "resolve" || msg.type === "reject") {
+      var waiter = pending[msg.args && msg.args.messageId];
+      if (waiter) {
+        delete pending[msg.args.messageId];
+        msg.type === "resolve" ? waiter.resolve(msg.args.value) : waiter.reject(msg.args.value);
+      }
+      return;
+    }
+
+    switch (msg.type) {
+      case "SIMID:Player:init":
+        handleInit(msg.args);
+        respond("resolve", msg.messageId, {});
+        break;
+      case "SIMID:Player:startCreative":
+        respond("resolve", msg.messageId, {});
+        onCreativeStarted();
+        break;
+      case "SIMID:Player:adSkipped":
+      case "SIMID:Player:adStopped":
+      case "SIMID:Player:fatalError":
+        respond("resolve", msg.messageId, {});
+        break;
+    }
+  }
+
+  function firePixelByHtml() {
+    if (!pixel) { return; }
+    var url = buildPixel(1);
+    var img = new Image();
+    img.src = url;
+  }
+
+  function firePixelByPlayer() {
+    if (!pixel) { return; }
+    var url = buildPixel(0);
+    sendMessage("SIMID:Creative:reportTracking", { trackingUrls: [url] }).catch(function () {});
+  }
+
+  function onCreativeStarted() {
+    firePixelByHtml();
+    firePixelByPlayer();
+  }
+
+  function init() {
+    window.addEventListener("message", onMessage);
+
+    if (inIframe) {
+      sessionId = uuidv4();
+      sendMessage("createSession");
+    } else {
+      pixel = "https://httpbin.org/get?logid=demo&evtid=video_perf&__q=DEMO";
+      onCreativeStarted();
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>
